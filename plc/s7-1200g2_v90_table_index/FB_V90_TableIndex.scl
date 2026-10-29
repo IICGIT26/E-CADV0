@@ -1,0 +1,568 @@
+// ============================================================================
+//  FB_V90_TableIndex
+//
+//  S7-1200 G2  <->  SINAMICS V90 PN (basic positioner / EPOS)
+//  Cyclic PROFINET communication with SIEMENS telegram 111 (PZD-12/12),
+//  positioning by TABLE INDEX.
+//
+//  What the block does
+//   - runs the PROFIdrive enable sequence (OFF1 / enable operation) and the
+//     fault-acknowledge sequence
+//   - moves to table entry [iTableIndex]
+//        xUseDriveTable = FALSE : entry is read from the PLC table (Table),
+//                                 sent to the drive as an MDI setpoint
+//        xUseDriveTable = TRUE  : entry is a traversing block stored in the
+//                                 V90 (V-ASSISTANT); only the index is sent
+//   - active homing, set reference point, jogging
+//   - teach-in: stores the actual position in the PLC table
+//   - exposes drive status, actual position, fault / warning codes
+//
+//  Telegram layout and control/status bits are defined in the constants
+//  section below. Entries tagged [VERIFY] were NOT confirmed against the
+//  V90 PN documentation - check them before the axis is moved (README.md).
+//
+//  Call the block every scan from a cyclic OB (OB1 or a cyclic interrupt).
+//  The block moves the telegram itself with DPRD_DAT / DPWR_DAT (consistent
+//  24-byte transfer); see regions Read_telegram and Write_telegram if the transport must change.
+//
+//  Error IDs (wErrorId)
+//   16#8001 table index out of range (0..15)
+//   16#8002 table entry invalid (velocity <= 0, acc/dec outside 0.01..199.99 %)
+//   16#8003 command rejected: drive not ready, busy, jogging or xAbort active
+//   16#8004 absolute move / teach requested but the axis is not homed
+//   16#8005 drive did not acknowledge the traversing task (tAckTimeout)
+//   16#8006 move or homing exceeded tMoveTimeout
+//   16#8007 drive did not start homing (reference point still set T#2s after the start)
+//   16#8010 DPRD_DAT error (see iRetValRd)
+//   16#8011 DPWR_DAT error (see iRetValWr)
+//   16#8021 drive did not reach "operation enabled" in time
+//  Errors are latched until xAck or xEnable rises (16#8010/8011 follow the fault live).
+// ============================================================================
+FUNCTION_BLOCK "FB_V90_TableIndex"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      hwIdIn : HW_IO;                    // HW identifier of the telegram 111 module, drive -> PLC
+      hwIdOut : HW_IO;                   // HW identifier of the telegram 111 module, PLC -> drive
+      xEnable : Bool;                    // TRUE = power on and enable operation, FALSE = OFF1
+      xAck : Bool;                       // Rising edge: acknowledge drive fault / clear latched error
+      xExecute : Bool;                   // Rising edge: move to table entry iTableIndex
+      xHalt : Bool;                      // TRUE = intermediate stop (resumes when released)
+      xAbort : Bool;                     // TRUE = reject the running traversing task / homing
+      xHome : Bool;                      // Rising edge: start active homing
+      xSetRef : Bool;                    // TRUE = set reference point at current position (standstill)
+      xRefCam : Bool;                    // Reference cam / homing switch signal, passed to the drive
+      xHomeDirNeg : Bool;                // Homing start direction: FALSE = positive, TRUE = negative [VERIFY polarity]
+      xJog1 : Bool;                      // Jog 1 (speed and direction set in the drive)
+      xJog2 : Bool;                      // Jog 2 (speed and direction set in the drive)
+      xTeach : Bool;                     // Rising edge: store actual position in Table[iTableIndex]
+      xUseDriveTable : Bool;             // FALSE = PLC table via MDI, TRUE = traversing block in the drive
+      iTableIndex : Int;                 // Table entry 0..15
+      rOverridePct : Real := 100.0;      // Velocity override [%], 0..199.99
+      wPosStw2Add : Word;                // Extra POS_STW2 bits OR-ed in (e.g. limit-switch enables)
+      tAckTimeout : Time := T#1s;        // Time allowed for the drive to acknowledge a task
+      tMoveTimeout : Time := T#0ms;      // Move / homing supervision, T#0ms = off
+   END_VAR
+
+   VAR_OUTPUT
+      xReady : Bool;                     // Operation enabled, no fault, idle - commands accepted
+      xBusy : Bool;                      // Move, homing or jog in progress
+      xDone : Bool;                      // Last table move finished (target reached)
+      xHomed : Bool;                     // Reference point set (ZSW1.11)
+      xFault : Bool;                     // Drive fault present (ZSW1.3)
+      xWarning : Bool;                   // Drive warning present (ZSW1.7)
+      xError : Bool;                     // Block error, see wErrorId
+      wErrorId : Word;                   // Error ID (see header)
+      wFaultCode : Word;                 // Drive fault number [VERIFY word position]
+      wWarnCode : Word;                  // Drive warning number [VERIFY word position]
+      diActPos : DInt;                   // Actual position XIST_A [LU]
+      diActVeloRaw : DInt;               // Actual speed NIST_B, raw (normalised to p2000, 16#4000_0000 = 100 %)
+      iActiveIndex : Int;                // Index of the move in progress / last move
+      iState : Int;                      // Internal state (see region State_machine)
+      wZsw1 : Word;                      // Raw ZSW1
+      wPosZsw1 : Word;                   // Raw POS_ZSW1
+      wPosZsw2 : Word;                   // Raw POS_ZSW2
+      iRetValRd : Int;                   // DPRD_DAT return value
+      iRetValWr : Int;                   // DPWR_DAT return value
+   END_VAR
+
+   VAR_IN_OUT
+      Table : Array[0..15] of "typeV90TableEntry";    // Position table (V90 has 16 traversing blocks)
+   END_VAR
+
+   VAR
+      aRx : Array[0..11] of Word;        // Telegram 111, drive -> PLC (PZD1..PZD12)
+      aTx : Array[0..11] of Word;        // Telegram 111, PLC -> drive (PZD1..PZD12)
+      stActive : "typeV90TableEntry";    // Snapshot of the entry being executed
+      tonState : TON_TIME;               // Time in current state
+      tState : Time;
+      iStatePrev : Int;
+      iIdxLatched : Int;
+      wErrLatched : Word;
+      xSrcDrive : Bool;                  // Source latched at Execute
+      xAckBefore : Bool;                 // ZSW1.12 before the start edge
+      xCommOk : Bool;
+      xEnableOld : Bool;
+      xAckOld : Bool;
+      xExecuteOld : Bool;
+      xHomeOld : Bool;
+      xTeachOld : Bool;
+   END_VAR
+
+   VAR_TEMP
+      xEnableRise : Bool;
+      xAckRise : Bool;
+      xExecRise : Bool;
+      xHomeRise : Bool;
+      xTeachRise : Bool;
+      xStateChg : Bool;
+      xJogReq : Bool;
+      xRtso : Bool;                      // ZSW1.0 ready to switch on
+      xOpEn : Bool;                      // ZSW1.2 operation enabled
+      xDrvFault : Bool;                  // ZSW1.3
+      xDrvWarn : Bool;                   // ZSW1.7
+      xInhibit : Bool;                   // ZSW1.6 switching on inhibited
+      xTgtReached : Bool;                // ZSW1.10
+      xRefOk : Bool;                     // ZSW1.11
+      xTaskAck : Bool;                   // ZSW1.12
+      xCmdOn : Bool;
+      wCheck : Word;
+      wStw1 : Word;
+      wPosStw1 : Word;
+      wPosStw2 : Word;
+      dwTmp : DWord;
+      rTmp : Real;
+      diTarPos : DInt;
+      diVelo : DInt;
+      wAcc : Word;
+      wDec : Word;
+   END_VAR
+
+   VAR CONSTANT
+      // ---- timing ---------------------------------------------------------
+      cT_SETUP : Time := T#30ms;         // setpoints on the wire before the start edge
+      cT_GUARD : Time := T#50ms;         // ignore ZSW1.10 right after the start edge
+      cT_CANCEL : Time := T#100ms;       // hold "reject traversing task"
+      cT_HOME_START : Time := T#2s;      // drive must drop "reference point set" after start
+      cT_ENABLE : Time := T#10s;         // max. time to reach operation enabled
+      cT_ACK_PULSE : Time := T#200ms;    // fault-ack pulse length
+      cT_ACK_FAIL : Time := T#2s;        // give up waiting for the fault to clear
+      // ---- table / scaling -----------------------------------------------
+      cTABLE_MAX : Int := 15;
+      cPCT_MAX : Real := 199.99;
+      cPCT_TO_RAW : Real := 163.84;      // 16#4000 = 100 %
+
+      // ---- telegram 111: PLC -> drive, index into aTx --------------------
+      cTX_STW1 : Int := 0;
+      cTX_POS_STW1 : Int := 1;
+      cTX_POS_STW2 : Int := 2;
+      cTX_STW2 : Int := 3;
+      cTX_OVERRIDE : Int := 4;
+      cTX_TARPOS_H : Int := 5;           // MDI_TARPOS, 32 bit, high word first
+      cTX_TARPOS_L : Int := 6;
+      cTX_VELO_H : Int := 7;             // MDI_VELOCITY, 32 bit, high word first
+      cTX_VELO_L : Int := 8;
+      cTX_ACC : Int := 9;                // MDI_ACC
+      cTX_DEC : Int := 10;               // MDI_DEC
+      cTX_USER : Int := 11;              // PZD12, user word (not used)
+
+      // ---- telegram 111: drive -> PLC, index into aRx [VERIFY order after ZSW1] ---
+      cRX_ZSW1 : Int := 0;
+      cRX_POS_ZSW1 : Int := 1;
+      cRX_POS_ZSW2 : Int := 2;
+      cRX_ZSW2 : Int := 3;
+      cRX_MELDW : Int := 4;
+      cRX_XIST_A_H : Int := 5;           // actual position, 32 bit
+      cRX_XIST_A_L : Int := 6;
+      cRX_NIST_B_H : Int := 7;           // actual speed, 32 bit
+      cRX_NIST_B_L : Int := 8;
+      cRX_FAULT : Int := 9;
+      cRX_WARN : Int := 10;
+      cRX_USER : Int := 11;
+
+      // ---- STW1 (control word 1) ------------------------------------------
+      cSTW1_ON : Word := 16#0001;           // bit 0  ON / OFF1
+      cSTW1_NO_OFF2 : Word := 16#0002;      // bit 1  no coast down (OFF2)
+      cSTW1_NO_OFF3 : Word := 16#0004;      // bit 2  no quick stop (OFF3)
+      cSTW1_ENABLE_OP : Word := 16#0008;    // bit 3  enable operation
+      cSTW1_NO_REJECT : Word := 16#0010;    // bit 4  do not reject traversing task
+      cSTW1_NO_INTERM : Word := 16#0020;    // bit 5  no intermediate stop
+      cSTW1_ACT_TASK : Word := 16#0040;     // bit 6  activate traversing task (edge)
+      cSTW1_ACK_FAULT : Word := 16#0080;    // bit 7  acknowledge fault (edge)
+      cSTW1_JOG1 : Word := 16#0100;         // bit 8  jog 1             [VERIFY]
+      cSTW1_JOG2 : Word := 16#0200;         // bit 9  jog 2             [VERIFY]
+      cSTW1_CTRL_PLC : Word := 16#0400;     // bit 10 control by PLC
+      cSTW1_START_HOME : Word := 16#0800;   // bit 11 start referencing [VERIFY]
+
+      // ---- POS_STW1 -------------------------------------------------------
+      cPOS1_BLOCK_MASK : Word := 16#003F;   // bits 0..5 traversing block select [VERIFY width]
+      cPOS1_MDI_ABS : Word := 16#2000;      // bit 13  MDI absolute (1) / relative (0) [VERIFY]
+      cPOS1_MDI_ACTIVE : Word := 16#8000;   // bit 15  activate MDI (Siemens EPOS documentation)
+
+      // ---- POS_STW2 (bits 1, 2, 8, 9 per Siemens EPOS documentation) -------
+      cPOS2_SET_REF : Word := 16#0002;      // bit 1  set reference point
+      cPOS2_REF_CAM : Word := 16#0004;      // bit 2  reference cam
+      cPOS2_HOME_DIR : Word := 16#0200;     // bit 9  homing start direction (bit 8 = 0: active homing)
+
+      // ---- ZSW1 (status word 1) -------------------------------------------
+      cZSW1_RTSO : Word := 16#0001;         // bit 0  ready to switch on
+      cZSW1_OP_EN : Word := 16#0004;        // bit 2  operation enabled
+      cZSW1_FAULT : Word := 16#0008;        // bit 3  fault present
+      cZSW1_INHIBIT : Word := 16#0040;      // bit 6  switching on inhibited
+      cZSW1_WARN : Word := 16#0080;         // bit 7  warning present
+      cZSW1_TGT_REACHED : Word := 16#0400;  // bit 10 target position reached [VERIFY]
+      cZSW1_REF_SET : Word := 16#0800;      // bit 11 reference point set     [VERIFY]
+      cZSW1_TASK_ACK : Word := 16#1000;     // bit 12 traversing task acknowledged [VERIFY]
+   END_VAR
+
+BEGIN
+   REGION Read_telegram
+      #iRetValRd := DPRD_DAT(LADDR := #hwIdIn, RECORD => #aRx);
+      #xCommOk := (#iRetValRd = 0);
+   END_REGION
+
+   REGION Decode_status
+      #wZsw1 := #aRx[#cRX_ZSW1];
+      #wPosZsw1 := #aRx[#cRX_POS_ZSW1];
+      #wPosZsw2 := #aRx[#cRX_POS_ZSW2];
+
+      #xRtso := (#wZsw1 AND #cZSW1_RTSO) <> 16#0000;
+      #xOpEn := (#wZsw1 AND #cZSW1_OP_EN) <> 16#0000;
+      #xDrvFault := (#wZsw1 AND #cZSW1_FAULT) <> 16#0000;
+      #xInhibit := (#wZsw1 AND #cZSW1_INHIBIT) <> 16#0000;
+      #xDrvWarn := (#wZsw1 AND #cZSW1_WARN) <> 16#0000;
+      #xTgtReached := (#wZsw1 AND #cZSW1_TGT_REACHED) <> 16#0000;
+      #xRefOk := (#wZsw1 AND #cZSW1_REF_SET) <> 16#0000;
+      #xTaskAck := (#wZsw1 AND #cZSW1_TASK_ACK) <> 16#0000;
+
+      #dwTmp := SHL(IN := WORD_TO_DWORD(#aRx[#cRX_XIST_A_H]), N := 16)
+                OR WORD_TO_DWORD(#aRx[#cRX_XIST_A_L]);
+      #diActPos := DWORD_TO_DINT(#dwTmp);
+
+      #dwTmp := SHL(IN := WORD_TO_DWORD(#aRx[#cRX_NIST_B_H]), N := 16)
+                OR WORD_TO_DWORD(#aRx[#cRX_NIST_B_L]);
+      #diActVeloRaw := DWORD_TO_DINT(#dwTmp);
+
+      #wFaultCode := #aRx[#cRX_FAULT];
+      #wWarnCode := #aRx[#cRX_WARN];
+   END_REGION
+
+   REGION Edges_and_timer
+      #xEnableRise := #xEnable AND NOT #xEnableOld;
+      #xAckRise := #xAck AND NOT #xAckOld;
+      #xExecRise := #xExecute AND NOT #xExecuteOld;
+      #xHomeRise := #xHome AND NOT #xHomeOld;
+      #xTeachRise := #xTeach AND NOT #xTeachOld;
+      #xJogReq := #xJog1 XOR #xJog2;
+
+      // The timer restarts whenever the state changed in the previous scan.
+      #xStateChg := (#iState <> #iStatePrev);
+      #iStatePrev := #iState;
+      #tonState(IN := NOT #xStateChg, PT := T#20d);
+      #tState := #tonState.ET;
+   END_REGION
+
+   REGION Error_housekeeping
+      IF #xAckRise OR #xEnableRise THEN
+         #wErrLatched := 16#0000;
+      END_IF;
+
+      // Move / homing commands are only accepted in state 10 (ready)
+      IF (#xExecRise OR #xHomeRise) AND (#iState <> 10) THEN
+         #wErrLatched := 16#8003;
+      END_IF;
+   END_REGION
+
+   REGION State_machine
+      // States
+      //   0 disabled (OFF1)            1 wait ready-to-switch-on
+      //   2 switching on / enabling    10 ready (operation enabled)
+      //  11 move: setpoints out       12 move: start edge, wait acknowledge
+      //  13 move: running             14 cancel (reject task)
+      //  20 homing: start             21 homing: running
+      //  90 drive fault               91 fault acknowledge pulse
+
+      // ---- overrides ------------------------------------------------------
+      IF NOT #xCommOk THEN
+         #iState := 0;
+         #xDone := FALSE;
+      ELSIF #iState <> 91 THEN
+         IF NOT #xEnable THEN
+            #iState := 0;
+            #xDone := FALSE;
+         ELSIF #xDrvFault THEN
+            #iState := 90;
+            #xDone := FALSE;
+         ELSIF (#iState >= 11) AND (#iState <= 21) AND (NOT #xOpEn) THEN
+            #iState := 1;                // drive dropped out of operation without a fault
+            #xDone := FALSE;
+         END_IF;
+      END_IF;
+
+      CASE #iState OF
+         0:   // disabled - OFF1 is low, the drive may leave "switching on inhibited"
+            IF #xEnable AND #xCommOk AND (NOT #xDrvFault) THEN
+               #iState := 1;
+            ELSIF #xDrvFault AND #xAckRise AND #xCommOk THEN
+               #iState := 91;
+            END_IF;
+
+         1:   // wait until the drive reports ready to switch on
+            IF #xRtso THEN
+               #iState := 2;
+            ELSIF #tState >= #cT_ENABLE THEN
+               #wErrLatched := 16#8021;
+            END_IF;
+
+         2:   // ON + enable operation
+            IF #xOpEn THEN
+               #iState := 10;
+            ELSIF #xInhibit THEN
+               #iState := 1;
+            ELSIF #tState >= #cT_ENABLE THEN
+               #wErrLatched := 16#8021;
+            END_IF;
+
+         10:  // ready
+            IF NOT #xOpEn THEN
+               #iState := 1;
+            ELSIF #xExecRise THEN
+               #wCheck := 16#0000;
+               IF (#iTableIndex < 0) OR (#iTableIndex > #cTABLE_MAX) THEN
+                  #wCheck := 16#8001;
+               ELSIF #xJogReq OR #xAbort THEN
+                  #wCheck := 16#8003;
+               ELSIF NOT #xUseDriveTable THEN
+                  #stActive := #Table[#iTableIndex];
+                  IF (#stActive.diVelocity <= 0)
+                     OR (#stActive.rAccPct <= 0.0) OR (#stActive.rAccPct > #cPCT_MAX)
+                     OR (#stActive.rDecPct <= 0.0) OR (#stActive.rDecPct > #cPCT_MAX) THEN
+                     #wCheck := 16#8002;
+                  ELSIF (NOT #stActive.xRelative) AND (NOT #xRefOk) THEN
+                     #wCheck := 16#8004;
+                  END_IF;
+               END_IF;
+
+               IF #wCheck <> 16#0000 THEN
+                  #wErrLatched := #wCheck;
+               ELSE
+                  #iIdxLatched := #iTableIndex;
+                  #iActiveIndex := #iTableIndex;
+                  #xSrcDrive := #xUseDriveTable;
+                  #xDone := FALSE;
+                  #iState := 11;
+               END_IF;
+            ELSIF #xHomeRise THEN
+               IF #xJogReq OR #xAbort THEN
+                  #wErrLatched := 16#8003;
+               ELSE
+                  #xDone := FALSE;
+                  #iState := 20;
+               END_IF;
+            END_IF;
+
+         11:  // setpoints / mode bits are sent first, the start edge follows
+            IF #xAbort THEN
+               #iState := 14;
+            ELSIF #tState >= #cT_SETUP THEN
+               #xAckBefore := #xTaskAck;
+               #iState := 12;
+            END_IF;
+
+         12:  // start edge sent, wait until the drive acknowledges the task
+            IF #xAbort THEN
+               #iState := 14;
+            ELSIF #xTaskAck <> #xAckBefore THEN
+               #iState := 13;
+            ELSIF #tState >= #tAckTimeout THEN
+               #wErrLatched := 16#8005;
+               #iState := 14;
+            END_IF;
+
+         13:  // move running
+            IF #xAbort THEN
+               #iState := 14;
+            ELSIF (#tState >= #cT_GUARD) AND #xTgtReached THEN
+               #xDone := TRUE;
+               #iState := 10;
+            ELSIF (#tMoveTimeout > T#0ms) AND (#tState >= #tMoveTimeout) THEN
+               #wErrLatched := 16#8006;
+               #iState := 14;
+            END_IF;
+
+         14:  // reject the task, then fall back to ready
+            IF #tState >= #cT_CANCEL THEN
+               #iState := 10;
+            END_IF;
+
+         20:  // homing start: the drive must drop "reference point set"
+            IF #xAbort THEN
+               #iState := 14;
+            ELSIF NOT #xRefOk THEN
+               #iState := 21;
+            ELSIF #tState >= #cT_HOME_START THEN
+               #wErrLatched := 16#8007;
+               #iState := 14;
+            END_IF;
+
+         21:  // homing running
+            IF #xAbort THEN
+               #iState := 14;
+            ELSIF #xRefOk THEN
+               #iState := 10;
+            ELSIF (#tMoveTimeout > T#0ms) AND (#tState >= #tMoveTimeout) THEN
+               #wErrLatched := 16#8006;
+               #iState := 14;
+            END_IF;
+
+         90:  // drive fault, wait for acknowledge
+            IF #xAckRise THEN
+               #iState := 91;
+            END_IF;
+
+         91:  // acknowledge pulse; leave when the fault has cleared
+            IF NOT #xDrvFault THEN
+               #iState := 0;
+            ELSIF #tState >= #cT_ACK_FAIL THEN
+               #iState := 90;
+            END_IF;
+
+         ELSE
+            #iState := 0;
+      END_CASE;
+   END_REGION
+
+   REGION Teach_in
+      IF #xTeachRise THEN
+         IF (#iTableIndex < 0) OR (#iTableIndex > #cTABLE_MAX) THEN
+            #wErrLatched := 16#8001;
+         ELSIF NOT #xRefOk THEN
+            #wErrLatched := 16#8004;
+         ELSE
+            #Table[#iTableIndex].diPosition := #diActPos;
+            #Table[#iTableIndex].xRelative := FALSE;
+         END_IF;
+      END_IF;
+   END_REGION
+
+   REGION Build_telegram
+      // ---- STW1 -----------------------------------------------------------
+      #wStw1 := #cSTW1_NO_OFF2 OR #cSTW1_NO_OFF3 OR #cSTW1_CTRL_PLC;
+      IF (NOT #xAbort) AND (#iState <> 14) THEN
+         #wStw1 := #wStw1 OR #cSTW1_NO_REJECT;
+      END_IF;
+      IF NOT #xHalt THEN
+         #wStw1 := #wStw1 OR #cSTW1_NO_INTERM;
+      END_IF;
+
+      #xCmdOn := (#iState = 2) OR ((#iState >= 10) AND (#iState <= 21));
+      IF #xCmdOn THEN
+         #wStw1 := #wStw1 OR #cSTW1_ON OR #cSTW1_ENABLE_OP;
+      END_IF;
+
+      IF (#iState = 12) OR (#iState = 13) THEN
+         #wStw1 := #wStw1 OR #cSTW1_ACT_TASK;
+      END_IF;
+      IF (#iState = 20) OR (#iState = 21) THEN
+         #wStw1 := #wStw1 OR #cSTW1_START_HOME;
+      END_IF;
+      IF (#iState = 10) AND #xJogReq THEN
+         IF #xJog1 THEN
+            #wStw1 := #wStw1 OR #cSTW1_JOG1;
+         ELSE
+            #wStw1 := #wStw1 OR #cSTW1_JOG2;
+         END_IF;
+      END_IF;
+      IF (#iState = 91) AND (#tState < #cT_ACK_PULSE) THEN
+         #wStw1 := #wStw1 OR #cSTW1_ACK_FAULT;
+      END_IF;
+
+      // ---- POS_STW1 and MDI setpoints ----------------------------------------
+      #wPosStw1 := 16#0000;
+      #diTarPos := 0;
+      #diVelo := 0;
+      #wAcc := 16#0000;
+      #wDec := 16#0000;
+
+      IF (#iState >= 11) AND (#iState <= 13) THEN
+         IF #xSrcDrive THEN
+            // traversing block stored in the drive: only the index is sent
+            #wPosStw1 := INT_TO_WORD(#iIdxLatched) AND #cPOS1_BLOCK_MASK;
+         ELSE
+            #wPosStw1 := #cPOS1_MDI_ACTIVE;
+            IF NOT #stActive.xRelative THEN
+               #wPosStw1 := #wPosStw1 OR #cPOS1_MDI_ABS;
+            END_IF;
+            #diTarPos := #stActive.diPosition;
+            #diVelo := #stActive.diVelocity;
+
+            #rTmp := LIMIT(MN := 0.0, IN := #stActive.rAccPct, MX := #cPCT_MAX) * #cPCT_TO_RAW;
+            #wAcc := INT_TO_WORD(REAL_TO_INT(#rTmp));
+            #rTmp := LIMIT(MN := 0.0, IN := #stActive.rDecPct, MX := #cPCT_MAX) * #cPCT_TO_RAW;
+            #wDec := INT_TO_WORD(REAL_TO_INT(#rTmp));
+         END_IF;
+      END_IF;
+
+      // ---- POS_STW2 ---------------------------------------------------------
+      #wPosStw2 := #wPosStw2Add;
+      IF #xRefCam THEN
+         #wPosStw2 := #wPosStw2 OR #cPOS2_REF_CAM;
+      END_IF;
+      IF #xHomeDirNeg THEN
+         #wPosStw2 := #wPosStw2 OR #cPOS2_HOME_DIR;
+      END_IF;
+      IF #xSetRef AND (#iState = 10) THEN
+         #wPosStw2 := #wPosStw2 OR #cPOS2_SET_REF;
+      END_IF;
+
+      // ---- assemble the 12 PZD words ----------------------------------------
+      #aTx[#cTX_STW1] := #wStw1;
+      #aTx[#cTX_POS_STW1] := #wPosStw1;
+      #aTx[#cTX_POS_STW2] := #wPosStw2;
+      #aTx[#cTX_STW2] := 16#0000;
+
+      #rTmp := LIMIT(MN := 0.0, IN := #rOverridePct, MX := #cPCT_MAX) * #cPCT_TO_RAW;
+      #aTx[#cTX_OVERRIDE] := INT_TO_WORD(REAL_TO_INT(#rTmp));
+
+      #dwTmp := DINT_TO_DWORD(#diTarPos);
+      #aTx[#cTX_TARPOS_H] := DWORD_TO_WORD(SHR(IN := #dwTmp, N := 16));
+      #aTx[#cTX_TARPOS_L] := DWORD_TO_WORD(#dwTmp);
+
+      #dwTmp := DINT_TO_DWORD(#diVelo);
+      #aTx[#cTX_VELO_H] := DWORD_TO_WORD(SHR(IN := #dwTmp, N := 16));
+      #aTx[#cTX_VELO_L] := DWORD_TO_WORD(#dwTmp);
+
+      #aTx[#cTX_ACC] := #wAcc;
+      #aTx[#cTX_DEC] := #wDec;
+      #aTx[#cTX_USER] := 16#0000;
+   END_REGION
+
+   REGION Write_telegram
+      #iRetValWr := DPWR_DAT(LADDR := #hwIdOut, RECORD := #aTx);
+   END_REGION
+
+   REGION Outputs
+      #xReady := (#iState = 10) AND (NOT #xJogReq);
+      #xBusy := ((#iState >= 11) AND (#iState <= 14))
+                OR (#iState = 20) OR (#iState = 21)
+                OR ((#iState = 10) AND #xJogReq);
+      #xHomed := #xRefOk;
+      #xFault := #xDrvFault;
+      #xWarning := #xDrvWarn;
+
+      IF NOT #xCommOk THEN
+         #wErrorId := 16#8010;
+      ELSIF #iRetValWr <> 0 THEN
+         #wErrorId := 16#8011;
+      ELSE
+         #wErrorId := #wErrLatched;
+      END_IF;
+      #xError := (#wErrorId <> 16#0000);
+
+      #xEnableOld := #xEnable;
+      #xAckOld := #xAck;
+      #xExecuteOld := #xExecute;
+      #xHomeOld := #xHome;
+      #xTeachOld := #xTeach;
+   END_REGION
+END_FUNCTION_BLOCK
