@@ -1,0 +1,20 @@
+// ============================================================================
+//  DB_V90_Table
+//  PLC-side position tables, one array of 16 entries per axis.
+//  Pass Axis1 to the InOut parameter "Table" of FB_V90_TableIndex.
+//
+//  Fill the start values in the DB editor or from the HMI. Mark the array
+//  retentive in the DB editor (Retain column) so taught positions survive a
+//  power cycle.
+// ============================================================================
+DATA_BLOCK "DB_V90_Table"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      Axis1 : Array[0..15] of "typeV90TableEntry";
+   END_VAR
+
+BEGIN
+
+END_DATA_BLOCK

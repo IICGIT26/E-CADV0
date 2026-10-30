@@ -1,0 +1,18 @@
+// ============================================================================
+//  typeV90TableEntry
+//  One row of the PLC-side position table used by FB_V90_TableIndex.
+//
+//  Import order in TIA Portal (External source files -> Generate blocks):
+//    1. typeV90TableEntry.scl   2. FB_V90_TableIndex.scl   3. DB_V90_Table.scl
+// ============================================================================
+TYPE "typeV90TableEntry"
+VERSION : 0.1
+   STRUCT
+      diPosition : DInt;            // Target position [LU, length units as configured in the V90]
+      diVelocity : DInt;            // Velocity [1000 LU/min]  (MDI_VELOCITY unit), must be > 0
+      rAccPct : Real := 100.0;      // Acceleration [% of drive maximum], 0.01 .. 199.99
+      rDecPct : Real := 100.0;      // Deceleration [% of drive maximum], 0.01 .. 199.99
+      xRelative : Bool;             // FALSE = absolute move, TRUE = relative (incremental) move
+   END_STRUCT;
+
+END_TYPE
